@@ -3,10 +3,40 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
+const mongoose = require("mongoose");
+const Room = require("./models/Room");
+const User = require("./models/User");
 
 const app = express();
 
 app.use(cors());
+app.use(express.json());
+
+if (process.env.MONGO_URI) {
+    mongoose.connect(process.env.MONGO_URI)
+        .then(() => console.log("MongoDB connected"))
+        .catch(err => console.error("MongoDB connection error:", err));
+} else {
+    console.log("No MONGO_URI found in .env, skipping MongoDB connection.");
+}
+
+app.post("/api/users", async (req, res) => {
+    try {
+        if (!process.env.MONGO_URI) return res.status(200).json({ message: "MongoDB not connected" });
+        const { uid, email, displayName, photoURL } = req.body;
+        let user = await User.findOne({ firebaseUid: uid });
+        if (user) {
+            user.lastLogin = Date.now();
+            await user.save();
+        } else {
+            user = new User({ firebaseUid: uid, email, displayName, photoURL });
+            await user.save();
+        }
+        res.status(200).json(user);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
 const server = http.createServer(app);
 
@@ -34,6 +64,18 @@ const removeUserFromRooms = (socketId) => {
 
         if (!leavingUser) continue;
 
+        if (process.env.MONGO_URI) {
+            Room.findOne({ roomId }).then(roomDoc => {
+                if (roomDoc) {
+                    const participant = roomDoc.participantsHistory.find(p => p.socketId === socketId && !p.leftAt);
+                    if (participant) {
+                        participant.leftAt = Date.now();
+                        roomDoc.save().catch(console.error);
+                    }
+                }
+            }).catch(console.error);
+        }
+
         room.participants =
             room.participants.filter(
                 (user) => user.socketId !== socketId
@@ -49,8 +91,11 @@ const removeUserFromRooms = (socketId) => {
 
             room.host =
                 room.participants[0].socketId;
+            
+            io.to(roomId).emit("toast_notification", { message: `${room.participants[0].username} is the new host!`, type: "success" });
         }
 
+        io.to(roomId).emit("toast_notification", { message: `${leavingUser.username} left the room.`, type: "warning" });
         io.to(roomId).emit(
             "user_left",
             room.participants
@@ -66,17 +111,52 @@ const removeUserFromRooms = (socketId) => {
 io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
 
-    socket.on("join_room", ({ roomId, username }) => {
+    socket.on("join_room", async ({ roomId, username }) => {
+
+        if (!roomId || !username) {
+            return socket.emit("room_error", { message: "Invalid room or username." });
+        }
+
+        // 4. Persistent Room Recovery & 5. Room Access Validation
+        if (!rooms[roomId]) {
+            if (process.env.MONGO_URI) {
+                try {
+                    const existingRoom = await Room.findOne({ roomId, status: 'active' });
+                    if (existingRoom) {
+                        rooms[roomId] = {
+                            host: existingRoom.hostId,
+                            participants: [],
+                            videoId: existingRoom.currentVideoId || "dQw4w9WgXcQ",
+                        };
+                    } else {
+                        // Creating a brand new room in memory
+                        rooms[roomId] = {
+                            host: socket.id,
+                            participants: [],
+                            videoId: "dQw4w9WgXcQ",
+                        };
+                    }
+                } catch (err) {
+                    console.error(err);
+                }
+            } else {
+                rooms[roomId] = {
+                    host: socket.id,
+                    participants: [],
+                    videoId: "dQw4w9WgXcQ",
+                };
+            }
+        }
+
+        // 6. Duplicate Username Handling
+        const isDuplicate = rooms[roomId].participants.some(p => p.username === username);
+        if (isDuplicate) {
+            return socket.emit("room_error", { message: "Username already taken in this room." });
+        }
 
         socket.join(roomId);
 
-        if (!rooms[roomId]) {
-            rooms[roomId] = {
-                host: socket.id,
-                participants: [],
-                videoId: "dQw4w9WgXcQ",
-            };
-        }
+
 
         const role =
             rooms[roomId].participants.length === 0
@@ -89,12 +169,29 @@ io.on("connection", (socket) => {
             role,
         });
 
+        if (process.env.MONGO_URI) {
+            Room.findOne({ roomId }).then(roomDoc => {
+                if (!roomDoc) {
+                    Room.create({
+                        roomId,
+                        hostId: rooms[roomId].host,
+                        currentVideoId: "dQw4w9WgXcQ",
+                        participantsHistory: [{ socketId: socket.id, username, role }]
+                    }).catch(err => console.error(err));
+                } else {
+                    roomDoc.participantsHistory.push({ socketId: socket.id, username, role });
+                    roomDoc.save().catch(err => console.error(err));
+                }
+            }).catch(err => console.error(err));
+        }
+
         console.log(rooms);
 
         io.to(roomId).emit(
             "user_joined",
             rooms[roomId].participants
         );
+        socket.to(roomId).emit("toast_notification", { message: `${username} joined the room!`, type: "success" });
         socket.emit("video_changed", {
             videoId: rooms[roomId].videoId,
         });
@@ -119,7 +216,8 @@ io.on("connection", (socket) => {
             user?.role !== "moderator"
         ) return;
         rooms[roomId].videoId = videoId;
-
+        
+        io.to(roomId).emit("toast_notification", { message: `${user.username} changed the video.`, type: "info" });
         io.to(roomId).emit("video_changed", {
             videoId,
         });
@@ -167,6 +265,14 @@ io.on("connection", (socket) => {
         });
     });
 
+    socket.on("send_chat", ({ roomId, message }) => {
+        socket.to(roomId).emit("receive_chat", message);
+    });
+
+    socket.on("send_reaction", ({ roomId, emoji, username }) => {
+        io.to(roomId).emit("receive_reaction", { emoji, username, id: Math.random().toString(36).substr(2, 9) });
+    });
+
     socket.on(
         "assign_role",
         ({ roomId, targetSocketId, newRole }) => {
@@ -188,6 +294,7 @@ io.on("connection", (socket) => {
 
             targetUser.role = newRole;
 
+            io.to(roomId).emit("toast_notification", { message: `${targetUser.username} is now a ${newRole}.`, type: "success" });
             io.to(roomId).emit(
                 "roles_updated",
                 rooms[roomId].participants
@@ -206,6 +313,7 @@ io.on("connection", (socket) => {
         targetUser.role = "host";         // Promote new host
         rooms[roomId].host = targetSocketId;
 
+        io.to(roomId).emit("toast_notification", { message: `${targetUser.username} is the new host!`, type: "success" });
         io.to(roomId).emit("roles_updated", rooms[roomId].participants);
     });
 
