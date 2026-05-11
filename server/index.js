@@ -81,30 +81,45 @@ const removeUserFromRooms = (socketId) => {
                 (user) => user.socketId !== socketId
             );
 
-        // Transfer host
-        if (
-            leavingUser.role === "host" &&
-            room.participants.length > 0
-        ) {
-
-            room.participants[0].role = "host";
-
-            room.host =
-                room.participants[0].socketId;
-            
-            io.to(roomId).emit("toast_notification", { message: `${room.participants[0].username} is the new host!`, type: "success" });
-        }
-
         io.to(roomId).emit("toast_notification", { message: `${leavingUser.username} left the room.`, type: "warning" });
-        io.to(roomId).emit(
-            "user_left",
-            room.participants
-        );
+        io.to(roomId).emit("user_left", room.participants);
 
-        // Delete empty room
-        if (room.participants.length === 0) {
-            delete rooms[roomId];
-        }
+        // GRACE PERIOD: 5 Seconds before transferring host or deleting room
+        setTimeout(() => {
+            const currentRoom = rooms[roomId];
+            if (!currentRoom) return;
+
+            // Did the user rejoin?
+            const hasRejoined = currentRoom.participants.some(p => p.username === leavingUser.username);
+
+            if (!hasRejoined) {
+                // If they were host, transfer host to next available participant
+                if (leavingUser.role === "host") {
+                    if (currentRoom.participants.length > 0) {
+                        const newHost = currentRoom.participants[0];
+                        newHost.role = "host";
+                        currentRoom.host = newHost.socketId;
+                        
+                        if (!currentRoom.roles) currentRoom.roles = {};
+                        currentRoom.roles[newHost.username] = "host";
+                        currentRoom.roles[leavingUser.username] = "participant"; // Demote leaver
+                        
+                        io.to(roomId).emit("toast_notification", { 
+                            message: `${newHost.username} is the new host!`, 
+                            type: "success",
+                            targetUsername: newHost.username,
+                            personalMessage: `You are the new host!`
+                        });
+                        io.to(roomId).emit("roles_updated", currentRoom.participants);
+                    }
+                }
+                
+                // If room empty, delete
+                if (currentRoom.participants.length === 0) {
+                    delete rooms[roomId];
+                }
+            }
+        }, 15000); // 15 seconds grace period for slower network refreshes
     }
 };
 
@@ -158,10 +173,20 @@ io.on("connection", (socket) => {
 
 
 
-        const role =
-            rooms[roomId].participants.length === 0
-                ? "host"
-                : "participant";
+        if (!rooms[roomId].roles) rooms[roomId].roles = {};
+
+        let role = "participant";
+        if (rooms[roomId].roles[username]) {
+            role = rooms[roomId].roles[username];
+        } else if (rooms[roomId].participants.length === 0) {
+            role = "host";
+        }
+
+        rooms[roomId].roles[username] = role;
+
+        if (role === "host") {
+            rooms[roomId].host = socket.id;
+        }
 
         rooms[roomId].participants.push({
             socketId: socket.id,
@@ -196,12 +221,32 @@ io.on("connection", (socket) => {
             videoId: rooms[roomId].videoId,
         });
 
-        if (rooms[roomId].host && rooms[roomId].host !== socket.id) {
-            io.to(rooms[roomId].host).emit("request_sync_status", { targetSocketId: socket.id });
+        let syncTarget = rooms[roomId].host && rooms[roomId].host !== socket.id ? rooms[roomId].host : null;
+        if (!syncTarget) {
+            const otherParticipant = rooms[roomId].participants.find(p => p.socketId !== socket.id);
+            if (otherParticipant) syncTarget = otherParticipant.socketId;
+        }
+        if (syncTarget) {
+            io.to(syncTarget).emit("request_sync_status", { targetSocketId: socket.id });
+        } else if (rooms[roomId].lastKnownTime !== undefined) {
+            let estimatedTime = Number(rooms[roomId].lastKnownTime) || 0;
+            if (rooms[roomId].lastKnownState === 1) { // playing
+                estimatedTime += (Date.now() - (rooms[roomId].lastUpdateTime || Date.now())) / 1000;
+            }
+            socket.emit("sync_initial_status", { currentTime: estimatedTime, state: rooms[roomId].lastKnownState || 2 });
+        }
+
+        if (rooms[roomId].chatHistory && rooms[roomId].chatHistory.length > 0) {
+            socket.emit("chat_history", rooms[roomId].chatHistory);
         }
     });
 
-    socket.on("send_sync_status", ({ targetSocketId, currentTime, state }) => {
+    socket.on("send_sync_status", ({ roomId, targetSocketId, currentTime, state }) => {
+        if (roomId && rooms[roomId]) {
+            rooms[roomId].lastKnownTime = currentTime;
+            rooms[roomId].lastKnownState = state;
+            rooms[roomId].lastUpdateTime = Date.now();
+        }
         io.to(targetSocketId).emit("sync_initial_status", { currentTime, state });
     });
     socket.on("change_video", ({ roomId, videoId }) => {
@@ -215,7 +260,17 @@ io.on("connection", (socket) => {
             user?.role !== "host" &&
             user?.role !== "moderator"
         ) return;
+        
+        if (!videoId) return; // Prevent empty video ids
+        
         rooms[roomId].videoId = videoId;
+        rooms[roomId].lastKnownTime = 0;
+        rooms[roomId].lastKnownState = 2; // Default to paused for new videos
+        rooms[roomId].lastUpdateTime = Date.now();
+        
+        if (process.env.MONGO_URI) {
+            Room.updateOne({ roomId }, { currentVideoId: videoId }).catch(console.error);
+        }
         
         io.to(roomId).emit("toast_notification", { message: `${user.username} changed the video.`, type: "info" });
         io.to(roomId).emit("video_changed", {
@@ -233,6 +288,13 @@ io.on("connection", (socket) => {
             user?.role !== "host" &&
             user?.role !== "moderator"
         ) return;
+        
+        if (rooms[roomId]) {
+            rooms[roomId].lastKnownTime = currentTime;
+            rooms[roomId].lastKnownState = 1;
+            rooms[roomId].lastUpdateTime = Date.now();
+        }
+        
         socket.to(roomId).emit("play_video", { currentTime });
     });
 
@@ -247,6 +309,13 @@ io.on("connection", (socket) => {
             user?.role !== "host" &&
             user?.role !== "moderator"
         ) return;
+        
+        if (rooms[roomId]) {
+            rooms[roomId].lastKnownTime = currentTime;
+            rooms[roomId].lastKnownState = 2;
+            rooms[roomId].lastUpdateTime = Date.now();
+        }
+        
         socket.to(roomId).emit("pause_video", { currentTime });
     });
     socket.on("seek_video", ({ roomId, currentTime }) => {
@@ -260,12 +329,24 @@ io.on("connection", (socket) => {
             user?.role !== "moderator"
         ) return;
 
+        if (rooms[roomId]) {
+            rooms[roomId].lastKnownTime = currentTime;
+            rooms[roomId].lastUpdateTime = Date.now();
+        }
+
         socket.to(roomId).emit("seek_video", {
             currentTime,
         });
     });
 
     socket.on("send_chat", ({ roomId, message }) => {
+        if (rooms[roomId]) {
+            if (!rooms[roomId].chatHistory) rooms[roomId].chatHistory = [];
+            rooms[roomId].chatHistory.push(message);
+            if (rooms[roomId].chatHistory.length > 50) {
+                rooms[roomId].chatHistory.shift(); // Keep only last 50 messages
+            }
+        }
         socket.to(roomId).emit("receive_chat", message);
     });
 
@@ -293,8 +374,16 @@ io.on("connection", (socket) => {
             if (!targetUser) return;
 
             targetUser.role = newRole;
+            
+            if (!rooms[roomId].roles) rooms[roomId].roles = {};
+            rooms[roomId].roles[targetUser.username] = newRole;
 
-            io.to(roomId).emit("toast_notification", { message: `${targetUser.username} is now a ${newRole}.`, type: "success" });
+            io.to(roomId).emit("toast_notification", { 
+                message: `${targetUser.username} is now a ${newRole}.`, 
+                type: "success",
+                targetUsername: targetUser.username,
+                personalMessage: `You are now a ${newRole}.`
+            });
             io.to(roomId).emit(
                 "roles_updated",
                 rooms[roomId].participants
@@ -312,8 +401,17 @@ io.on("connection", (socket) => {
         currentUser.role = "participant"; // Demote current host
         targetUser.role = "host";         // Promote new host
         rooms[roomId].host = targetSocketId;
+        
+        if (!rooms[roomId].roles) rooms[roomId].roles = {};
+        rooms[roomId].roles[currentUser.username] = "participant";
+        rooms[roomId].roles[targetUser.username] = "host";
 
-        io.to(roomId).emit("toast_notification", { message: `${targetUser.username} is the new host!`, type: "success" });
+        io.to(roomId).emit("toast_notification", { 
+            message: `${targetUser.username} is the new host!`, 
+            type: "success",
+            targetUsername: targetUser.username,
+            personalMessage: `You are the new host!`
+        });
         io.to(roomId).emit("roles_updated", rooms[roomId].participants);
     });
 

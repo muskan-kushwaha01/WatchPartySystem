@@ -36,20 +36,74 @@ function Room() {
     const lastTimeRef = useRef(0);
     const lastCheckedTimeRef = useRef(Date.now());
     const pendingSyncRef = useRef(null);
+    const lastSyncRef = useRef(null);     // Survives player recreation
+    const pendingPauseRef = useRef(false); // Event-driven pause after frame render
     const syncTimeoutRef = useRef(null);
+    const isMountedRef = useRef(true);    // Stop stale callbacks after unmount
 
     const setSyncing = () => {
         isSyncingRef.current = true;
         if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
-        syncTimeoutRef.current = setTimeout(() => { isSyncingRef.current = false; }, 2000);
+        syncTimeoutRef.current = setTimeout(() => { isSyncingRef.current = false; }, 1500);
+    };
+
+    // Apply a sync payload to the player.
+    // For paused state, sets pendingPauseRef so onStateChange pauses as soon as the frame renders.
+    // Also updates lastTimeRef so the drift-detection interval doesn't emit a bogus seek.
+    const applySyncToPlayer = (player, currentTime, state) => {
+        if (!player || !isMountedRef.current) return;
+        lastSyncRef.current = { currentTime, state };
+        // Reset drift tracking to the synced position so the interval doesn't false-trigger
+        if (currentTime != null && !isNaN(currentTime)) {
+            lastTimeRef.current = currentTime;
+        }
+        lastCheckedTimeRef.current = Date.now();
+        setSyncing();
+        if (currentTime != null && !isNaN(currentTime) && currentTime > 0) {
+            player.seekTo(currentTime, true);
+        }
+        if (state === 1) {
+            player.playVideo();
+        } else {
+            // Paused: signal onStateChange to pause as soon as the frame is actually rendered.
+            // This is event-driven and avoids the arbitrary-timeout blank-screen bug.
+            pendingPauseRef.current = true;
+            player.playVideo();
+        }
+    };
+
+    // Snap a participant back to the correct host-controlled position.
+    // Called when a participant tries to play, pause, or seek without authorization.
+    const revertParticipantToCorrectState = () => {
+        if (!playerRef.current || !isMountedRef.current) return;
+        const lastState = lastSyncRef.current?.state ?? 2;
+        const elapsed = lastState === 1 ? (Date.now() - lastCheckedTimeRef.current) / 1000 : 0;
+        const expectedTime = Math.max(0, lastTimeRef.current + elapsed);
+        setSyncing();
+        if (expectedTime > 0) {
+            playerRef.current.seekTo(expectedTime, true);
+        }
+        if (lastState === 1) {
+            playerRef.current.playVideo();
+        } else {
+            playerRef.current.pauseVideo();
+        }
     };
 
     useEffect(() => {
-        chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+        window.scrollTo(0, 0);
+    }, []);
+
+    useEffect(() => {
+        if (chatMessages.length > 0) {
+            chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        }
     }, [chatMessages]);
 
 
     useEffect(() => {
+
+        isMountedRef.current = true;
 
         socket.emit("join_room", {
             roomId,
@@ -69,7 +123,7 @@ function Room() {
 
                 if (data && data.currentTime !== undefined) {
                     const currentLocalTime = playerRef.current.getCurrentTime();
-                    if (Math.abs(currentLocalTime - data.currentTime) > 2.0) {
+                    if (Math.abs(currentLocalTime - data.currentTime) > 1.0) {
                         playerRef.current.seekTo(data.currentTime, true);
                     }
                 }
@@ -96,13 +150,10 @@ function Room() {
 
         const handleSyncInitialStatus = ({ currentTime, state }) => {
             if (playerRef.current) {
-                setSyncing();
-                playerRef.current.seekTo(currentTime, true);
-                if (state === 1) {
-                    playerRef.current.playVideo();
-                } else {
-                    playerRef.current.pauseVideo();
-                }
+                setTimeout(() => {
+                    if (!isMountedRef.current || !playerRef.current) return;
+                    applySyncToPlayer(playerRef.current, currentTime, state);
+                }, 500);
             } else {
                 pendingSyncRef.current = { currentTime, state };
             }
@@ -125,9 +176,13 @@ function Room() {
             alert("You have been kicked from the room by the host.");
             navigate("/");
         };
-        const handleToastNotification = ({ message, type }) => {
+        const handleToastNotification = ({ message, type, targetUsername, personalMessage }) => {
+            let displayMessage = message;
+            if (targetUsername && targetUsername === username && personalMessage) {
+                displayMessage = personalMessage;
+            }
             const id = Date.now();
-            setNotification({ message, type: type || 'info', id });
+            setNotification({ message: displayMessage, type: type || 'info', id });
             setTimeout(() => {
                 setNotification(prev => (prev?.id === id ? null : prev));
             }, 3000);
@@ -138,6 +193,13 @@ function Room() {
         };
         const handleReceiveChat = (msg) => {
             setChatMessages(prev => [...prev, { ...msg, self: false }]);
+        };
+        const handleChatHistory = (history) => {
+            const processedHistory = history.map(msg => ({
+                ...msg,
+                self: msg.author === username
+            }));
+            setChatMessages(processedHistory);
         };
         const handleReceiveReaction = (reaction) => {
             const leftPosition = Math.floor(Math.random() * 80) + 10;
@@ -166,22 +228,22 @@ function Room() {
         socket.on("sync_initial_status", handleSyncInitialStatus);
         socket.on("request_sync_status", handleRequestSyncStatus);
         socket.on("receive_chat", handleReceiveChat);
+        socket.on("chat_history", handleChatHistory);
         socket.on("receive_reaction", handleReceiveReaction);
+
         return () => {
+            isMountedRef.current = false; // Stop all pending async callbacks
+            playerRef.current = null;     // Prevent any stale YouTube API calls
+            if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
 
             socket.emit("leave_room", {
                 roomId,
             });
 
             socket.off("user_joined", handleUserJoined);
-
             socket.off("user_left", handleUserLeft);
-
             socket.off("video_changed", handleVideoChanged);
-            socket.off(
-                "roles_updated",
-                handleRolesUpdated
-            );
+            socket.off("roles_updated", handleRolesUpdated);
             socket.off("kicked", handleKicked);
             socket.off("toast_notification", handleToastNotification);
             socket.off("room_error", handleRoomError);
@@ -191,6 +253,7 @@ function Room() {
             socket.off("sync_initial_status", handleSyncInitialStatus);
             socket.off("request_sync_status", handleRequestSyncStatus);
             socket.off("receive_chat", handleReceiveChat);
+            socket.off("chat_history", handleChatHistory);
             socket.off("receive_reaction", handleReceiveReaction);
         };
 
@@ -228,13 +291,13 @@ function Room() {
                 expectedTime += elapsedSeconds;
             }
 
-            if (Math.abs(currentTime - expectedTime) > 2.0) {
+            if (Math.abs(currentTime - expectedTime) > 1.0) {
                 socket.emit("seek_video", { roomId, currentTime });
             }
 
             lastTimeRef.current = currentTime;
             lastCheckedTimeRef.current = now;
-        }, 1000);
+        }, 500);
 
         return () => clearInterval(interval);
     }, [currentUser, roomId]);
@@ -332,7 +395,7 @@ function Room() {
                                 ))}
                             </div>
                             {videoId ? (
-                                <div style={{ pointerEvents: isAuthorized ? 'auto' : 'none', width: '100%', height: '100%' }}>
+                                <div style={{ width: '100%', height: '100%' }}>
                                     <YouTube
                                         videoId={videoId}
                                         opts={{
@@ -340,35 +403,55 @@ function Room() {
                                             height: "100%",
                                             playerVars: {
                                                 autoplay: 0,
-                                                disablekb: isAuthorized ? 0 : 1,
+                                                enablejsapi: 1,
+                                                // NOTE: disablekb intentionally removed.
+                                                // Changing it based on isAuthorized would destroy
+                                                // and recreate the player, wiping all sync state.
+                                                // Interaction is restricted via pointerEvents on the wrapper.
+                                                origin: window.location.origin,
                                             },
                                         }}
                                         onReady={(event) => {
                                             playerRef.current = event.target;
-                                            lastTimeRef.current = playerRef.current.getCurrentTime();
+                                            lastTimeRef.current = 0;
                                             lastCheckedTimeRef.current = Date.now();
-                                            if (pendingSyncRef.current) {
-                                                const { currentTime, state } = pendingSyncRef.current;
-                                                setSyncing();
-                                                playerRef.current.seekTo(currentTime, true);
-                                                if (state === 1) {
-                                                    playerRef.current.playVideo();
-                                                } else {
-                                                    playerRef.current.pauseVideo();
-                                                }
+                                            // pendingSyncRef: sync arrived before onReady
+                                            // lastSyncRef: player was recreated, reapply last known sync
+                                            const syncToApply = pendingSyncRef.current || lastSyncRef.current;
+                                            if (syncToApply) {
+                                                const { currentTime, state } = syncToApply;
                                                 pendingSyncRef.current = null;
-                                            } else if (!isAuthorizedRef.current) {
-                                                // Enforce pause if we are a participant and no sync data is ready yet
-                                                playerRef.current.pauseVideo();
+                                                setTimeout(() => {
+                                                    if (!isMountedRef.current || !playerRef.current) return;
+                                                    applySyncToPlayer(playerRef.current, currentTime, state);
+                                                }, 500);
                                             }
                                         }}
                                         onStateChange={(event) => {
-                                            if (isSyncingRef.current) return;
-                                            if (event.data === 1 && isAuthorizedRef.current) {
-                                                socket.emit("play_video", { roomId, currentTime: playerRef.current.getCurrentTime() });
+                                            // 1. Event-driven pause: fires when YouTube renders the buffered frame
+                                            if (event.data === 1 && pendingPauseRef.current) {
+                                                pendingPauseRef.current = false;
+                                                playerRef.current.pauseVideo();
+                                                return;
                                             }
-                                            if (event.data === 2 && isAuthorizedRef.current) {
-                                                socket.emit("pause_video", { roomId, currentTime: playerRef.current.getCurrentTime() });
+                                            // 2. Ignore state changes triggered by our own sync commands
+                                            if (isSyncingRef.current) return;
+                                            // 3. Authorized users (host/mod): broadcast their actions to the room
+                                            if (isAuthorizedRef.current) {
+                                                if (event.data === 1) {
+                                                    socket.emit("play_video", { roomId, currentTime: playerRef.current.getCurrentTime() });
+                                                }
+                                                if (event.data === 2) {
+                                                    socket.emit("pause_video", { roomId, currentTime: playerRef.current.getCurrentTime() });
+                                                }
+                                                return;
+                                            }
+                                            // 4. Participants: instantly revert unauthorized play (1) or pause (2).
+                                            //    data=3 (buffering) is NOT reverted here — it resolves to 1 or 2
+                                            //    which are caught above. Volume/captions/settings don't fire
+                                            //    onStateChange at all, so they are always freely allowed.
+                                            if (event.data === 1 || event.data === 2) {
+                                                revertParticipantToCorrectState();
                                             }
                                         }}
                                     />
