@@ -24,8 +24,9 @@ function Home() {
         try {
             const loggedInUser = await signInWithGoogle();
             
+            const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:5000";
             // Send user data to MongoDB (if configured)
-            fetch("http://localhost:5000/api/users", {
+            fetch(`${BACKEND_URL}/api/users`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
