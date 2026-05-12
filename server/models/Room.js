@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const RoomSchema = new mongoose.Schema({
     roomId: { type: String, required: true, unique: true },
     hostId: { type: String, required: true },
-    currentVideoId: { type: String, default: "dQw4w9WgXcQ" },
+    currentVideoId: { type: String, default: "UxmIr3uBOGU" },
     status: { type: String, enum: ['active', 'closed'], default: 'active' },
     participantsHistory: [{
         socketId: String,

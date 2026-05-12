@@ -141,14 +141,14 @@ io.on("connection", (socket) => {
                         rooms[roomId] = {
                             host: existingRoom.hostId,
                             participants: [],
-                            videoId: existingRoom.currentVideoId || "dQw4w9WgXcQ",
+                            videoId: existingRoom.currentVideoId || "UxmIr3uBOGU",
                         };
                     } else {
                         // Creating a brand new room in memory
                         rooms[roomId] = {
                             host: socket.id,
                             participants: [],
-                            videoId: "dQw4w9WgXcQ",
+                            videoId: "UxmIr3uBOGU",
                         };
                     }
                 } catch (err) {
@@ -158,7 +158,7 @@ io.on("connection", (socket) => {
                 rooms[roomId] = {
                     host: socket.id,
                     participants: [],
-                    videoId: "dQw4w9WgXcQ",
+                    videoId: "UxmIr3uBOGU",
                 };
             }
         }
@@ -200,7 +200,7 @@ io.on("connection", (socket) => {
                     Room.create({
                         roomId,
                         hostId: rooms[roomId].host,
-                        currentVideoId: "dQw4w9WgXcQ",
+                        currentVideoId: "UxmIr3uBOGU",
                         participantsHistory: [{ socketId: socket.id, username, role }]
                     }).catch(err => console.error(err));
                 } else {
