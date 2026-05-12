@@ -2,6 +2,8 @@
 
 Watch YouTube videos in sync with friends.
 
+-github link- https://github.com/muskan-kushwaha01/WatchPartySystem.git
+
 ## Live Links
 
 - **Frontend:** https://watchpartysystem.onrender.com/
